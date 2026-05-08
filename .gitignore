@@ -1,4 +1,7 @@
+*.pyc
+
 *.local
 *.local.*
 
 /data/
+/logs/
