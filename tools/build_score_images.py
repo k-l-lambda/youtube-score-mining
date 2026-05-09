@@ -24,6 +24,7 @@ from PIL import Image
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 VIDEO_EXTENSIONS = {".webm", ".mkv", ".mp4", ".mov", ".m4v"}
 DEFAULT_LAYOUT_API_URL = "http://localhost:3080/api/predict/layout"
+WEBP_MAX_DIMENSION = 16383
 SECONDS_RE = re.compile(r"^\s*seconds:\s*([0-9.]+)\s*$")
 
 
@@ -264,31 +265,76 @@ def image_size(image_path: Path) -> dict[str, int]:
     return {"width": image.width, "height": image.height}
 
 
-def build_stacked_score(frame_paths: list[Path], score_path: Path) -> None:
-    if not frame_paths:
-        return
-    inputs: list[str] = []
+def score_part_path(score_path: Path, part_index: int) -> Path:
+    if part_index == 1:
+        return score_path
+    return score_path.with_name(f"{score_path.stem}{part_index}{score_path.suffix}")
+
+
+def split_frame_paths(frame_paths: list[Path]) -> list[list[Path]]:
+    parts: list[list[Path]] = []
+    current: list[Path] = []
+    current_height = 0
     for frame_path in frame_paths:
-        inputs.extend(["-i", str(frame_path)])
-    filter_complex = "".join(f"[{index}:v]" for index in range(len(frame_paths))) + f"vstack=inputs={len(frame_paths)}[v]"
-    score_path.parent.mkdir(parents=True, exist_ok=True)
-    run_command([
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        *inputs,
-        "-filter_complex",
-        filter_complex,
-        "-map",
-        "[v]",
-        "-compression_level",
-        "6",
-        "-quality",
-        "90",
-        str(score_path),
-    ], capture=False)
+        size = image_size(frame_path)
+        frame_height = size["height"]
+        if current and current_height + frame_height > WEBP_MAX_DIMENSION:
+            parts.append(current)
+            current = []
+            current_height = 0
+        current.append(frame_path)
+        current_height += frame_height
+    if current:
+        parts.append(current)
+    return parts
+
+
+def build_stacked_score(frame_paths: list[Path], score_path: Path) -> list[Path]:
+    if not frame_paths:
+        return []
+    written_paths = []
+    for part_index, part_frame_paths in enumerate(split_frame_paths(frame_paths), start=1):
+        output_path = score_part_path(score_path, part_index)
+        score_path.parent.mkdir(parents=True, exist_ok=True)
+        if len(part_frame_paths) == 1:
+            run_command([
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(part_frame_paths[0]),
+                "-compression_level",
+                "6",
+                "-quality",
+                "90",
+                str(output_path),
+            ], capture=False)
+        else:
+            inputs: list[str] = []
+            for frame_path in part_frame_paths:
+                inputs.extend(["-i", str(frame_path)])
+            filter_complex = "".join(f"[{index}:v]" for index in range(len(part_frame_paths))) + f"vstack=inputs={len(part_frame_paths)}[v]"
+            run_command([
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                *inputs,
+                "-filter_complex",
+                filter_complex,
+                "-map",
+                "[v]",
+                "-compression_level",
+                "6",
+                "-quality",
+                "90",
+                str(output_path),
+            ], capture=False)
+        written_paths.append(output_path)
+    return written_paths
 
 
 def build_score_image(video_path: Path, meta_path: Path, score_path: Path, args: argparse.Namespace) -> None:
@@ -320,13 +366,14 @@ def build_score_image(video_path: Path, meta_path: Path, score_path: Path, args:
                     **layout_summary,
                 })
             frame_paths.append(frame_path)
-        build_stacked_score(frame_paths, score_path)
+        written_paths = build_stacked_score(frame_paths, score_path)
     if not args.no_layout:
         write_meta_layout(meta_path, {
             "frame_size": frame_size,
+            "score_images": [path.name for path in written_paths],
             "frames": layout_frames,
         })
-    print(f"wrote {score_path}", flush=True)
+    print(f"wrote {', '.join(str(path) for path in written_paths)}", flush=True)
 
 
 def parse_args() -> argparse.Namespace:
