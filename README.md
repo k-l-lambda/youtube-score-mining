@@ -15,6 +15,7 @@ Create `.env.local` in the project root:
 ```bash
 DATA_DIR=./data
 LAYOUT_API_URL=http://a-starry-service-host/api/predict/layout
+BRACKETS_PREDICTOR=tcp://a-starry-service-host:12028
 TRANSKUN_V2_CHECKPOINT=~/path/to/TRANSKUN_V2_CHECKPOINT
 ```
 
@@ -25,6 +26,7 @@ Required:
 Optional:
 
 - `LAYOUT_API_URL`: Starry layout prediction endpoint used by `tools/build_score_images.py`.
+- `BRACKETS_PREDICTOR`: Starry brackets ZeroMQ predictor used by `tools/recognize_brackets.py`.
 - `TRANSKUN_V2_CHECKPOINT`: Transkun checkpoint used only when MIDI transcription is requested.
 
 Required executables:
@@ -77,8 +79,15 @@ Run only the score-video filter:
 python3 tools/segment.py --score-filter-only
 ```
 
+Also run per-system bracket recognition and infer staff layout masks:
+
+```bash
+python3 tools/recognize_brackets.py --output temp/brackets.json
+```
+
 Also transcribe audio to MIDI with Transkun:
 
 ```bash
 python3 tools/extract_audio.py --midi --device cuda
 ```
+
