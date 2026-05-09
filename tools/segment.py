@@ -7,7 +7,6 @@ import argparse
 import json
 import os
 import re
-import statistics
 import subprocess
 import sys
 import tempfile
@@ -34,6 +33,21 @@ class TimeWindow:
     maximum: float
 
 
+@dataclass(frozen=True)
+class FrameStats:
+    seconds: float
+    yavg: float
+    satavg: float
+
+
+@dataclass(frozen=True)
+class FramePairStats:
+    seconds: float
+    yavg: float
+    satavg: float
+    diff: float
+
+
 def load_env(env_path: Path, *, override: bool = False) -> None:
     if not env_path.exists():
         return
@@ -48,12 +62,12 @@ def load_env(env_path: Path, *, override: bool = False) -> None:
             os.environ[key] = value
 
 
-def run_command(args: list[str], *, capture: bool = True) -> subprocess.CompletedProcess[str]:
+def run_command(args: list[str], *, capture: bool = True, text: bool = True) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(
             args,
             check=True,
-            text=True,
+            text=text,
             stdout=subprocess.PIPE if capture else None,
             stderr=subprocess.PIPE if capture else None,
         )
@@ -136,6 +150,119 @@ def collect_scene_samples(video_path: Path) -> list[SceneSample]:
         samples.append(SceneSample(pending_seconds, float(scene_match.group(1))))
         pending_seconds = None
     return samples
+
+
+def sample_frame_stats(video_path: Path, duration: float, sample_count: int, skip_fraction: float) -> list[FrameStats]:
+    if sample_count <= 0:
+        return []
+    bounded_skip = min(max(skip_fraction, 0.0), 0.45)
+    start = duration * bounded_skip
+    span = max(duration * (1.0 - 2.0 * bounded_skip), 1.0)
+    interval = max(span / sample_count, 0.001)
+    result = run_command([
+        "ffmpeg",
+        "-hide_banner",
+        "-nostats",
+        "-ss",
+        format_seconds(start),
+        "-t",
+        format_seconds(span),
+        "-i",
+        str(video_path),
+        "-vf",
+        f"fps=1/{format_seconds(interval)},scale=32:32,format=rgb24",
+        "-f",
+        "rawvideo",
+        "-",
+    ], text=False)
+    frame_size = 32 * 32 * 3
+    stats: list[FrameStats] = []
+    for index in range(0, len(result.stdout), frame_size):
+        frame = result.stdout[index:index + frame_size]
+        if len(frame) != frame_size:
+            continue
+        stats.append(analyze_frame(frame, start + len(stats) * interval))
+    return stats
+
+
+def sample_frame_pair_stats(video_path: Path, duration: float, pair_count: int, frame_delta: float) -> list[FramePairStats]:
+    if pair_count <= 0:
+        return []
+    start = duration * 0.35
+    span = duration * 0.3
+    interval = span / max(pair_count - 1, 1)
+    stats: list[FramePairStats] = []
+    for index in range(pair_count):
+        first_seconds = min(max(start + index * interval, 0.0), max(duration - frame_delta, 0.0))
+        first = extract_rgb_frame(video_path, first_seconds)
+        second = extract_rgb_frame(video_path, first_seconds + frame_delta)
+        if first is None or second is None:
+            continue
+        frame_stats = analyze_frame(first, first_seconds)
+        stats.append(FramePairStats(frame_stats.seconds, frame_stats.yavg, frame_stats.satavg, mean_frame_diff(first, second)))
+    return stats
+
+
+def extract_rgb_frame(video_path: Path, seconds: float) -> bytes | None:
+    result = run_command([
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-ss",
+        format_seconds(seconds),
+        "-i",
+        str(video_path),
+        "-frames:v",
+        "1",
+        "-vf",
+        "scale=32:32,format=rgb24",
+        "-f",
+        "rawvideo",
+        "-",
+    ], text=False)
+    frame_size = 32 * 32 * 3
+    if len(result.stdout) < frame_size:
+        return None
+    return result.stdout[:frame_size]
+
+
+def analyze_frame(frame: bytes, seconds: float) -> FrameStats:
+    pixel_count = len(frame) // 3
+    y_total = 0.0
+    sat_total = 0.0
+    for index in range(0, len(frame), 3):
+        red = frame[index]
+        green = frame[index + 1]
+        blue = frame[index + 2]
+        maximum = max(red, green, blue)
+        minimum = min(red, green, blue)
+        y_total += 0.299 * red + 0.587 * green + 0.114 * blue
+        if maximum:
+            sat_total += (maximum - minimum) / maximum * 255.0
+    return FrameStats(seconds, y_total / pixel_count, sat_total / pixel_count)
+
+
+def mean_frame_diff(first: bytes, second: bytes) -> float:
+    if len(first) != len(second) or not first:
+        return 0.0
+    return sum(abs(left - right) for left, right in zip(first, second)) / len(first)
+
+
+def is_score_video(stats: list[FrameStats], yavg_min: float, satavg_max: float, min_fraction: float) -> bool:
+    if not stats:
+        return True
+    qualifying = sum(1 for item in stats if item.yavg >= yavg_min and item.satavg <= satavg_max)
+    return qualifying / len(stats) >= min_fraction
+
+
+def is_score_video_from_pairs(stats: list[FramePairStats], yavg_min: float, satavg_max: float, min_fraction: float, diff_max: float) -> bool:
+    if not stats:
+        return True
+    if all(item.diff > diff_max for item in stats):
+        return False
+    qualifying = sum(1 for item in stats if item.yavg >= yavg_min and item.satavg <= satavg_max)
+    return qualifying / len(stats) >= min_fraction
 
 
 def build_windows(samples: list[SceneSample], duration: float, window_seconds: float) -> list[TimeWindow]:
@@ -308,8 +435,16 @@ def segment_video(video_path: Path, scores_dir: Path, args: argparse.Namespace) 
         print(f"skip existing {video_id}")
         return
 
-    print(f"segment {video_id}: {video_path.name}", flush=True)
     duration = probe_duration(video_path)
+    frame_stats = sample_frame_pair_stats(video_path, duration, args.score_filter_pairs, args.score_filter_frame_delta)
+    if not is_score_video_from_pairs(frame_stats, args.score_filter_yavg_min, args.score_filter_satavg_max, args.score_filter_min_fraction, args.score_filter_diff_max):
+        print(f"skip non-score {video_id}", flush=True)
+        return
+    if args.score_filter_only:
+        print(f"pass score-filter {video_id}", flush=True)
+        return
+
+    print(f"segment {video_id}: {video_path.name}", flush=True)
     samples = collect_scene_samples(video_path)
     windows = build_windows(samples, duration, args.window_seconds)
     stable_start = find_stable_start(samples, duration, args.stable_max, args.stable_seconds, args.intro_search_seconds, args.intro_change_threshold)
@@ -359,6 +494,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--minimum-outro-seconds", type=float, default=10.0, help="Minimum trailing stable duration to mark outro. Default: 10")
     parser.add_argument("--limit", type=int, help="Process at most this many videos.")
     parser.add_argument("--video-id", action="append", help="Only process this video ID. Can be used multiple times.")
+    parser.add_argument("--score-filter-only", action="store_true", help="Only run the score-video filter without generating sample outputs.")
+    parser.add_argument("--score-filter-pairs", type=int, default=3, help="Number of adjacent frame pairs to sample for score filtering. Default: 3")
+    parser.add_argument("--score-filter-frame-delta", type=float, default=0.25, help="Seconds between adjacent sampled frames. Default: 0.25")
+    parser.add_argument("--score-filter-yavg-min", type=float, default=100.0, help="Minimum average luma for score-like frames. Default: 100")
+    parser.add_argument("--score-filter-satavg-max", type=float, default=5.0, help="Maximum average saturation for score-like frames. Default: 5")
+    parser.add_argument("--score-filter-min-fraction", type=float, default=0.5, help="Minimum qualifying frame fraction for score filtering. Default: 0.5")
+    parser.add_argument("--score-filter-diff-max", type=float, default=8.0, help="Reject if every sampled adjacent frame pair differs above this mean RGB delta. Default: 8")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing sample outputs.")
     parser.add_argument("--audio", action="store_true", help="Also extract audio.wav.")
     parser.add_argument("--score", action="store_true", help="Also generate score.webp.")
