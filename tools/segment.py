@@ -406,7 +406,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env-local", type=Path, default=PROJECT_ROOT / ".env.local", help="Higher-priority environment file. Default: .env.local")
     parser.add_argument("--video-dir", type=Path, help="Input video directory. Default: $DATA_DIR/video")
     parser.add_argument("--scores-dir", type=Path, help="Output scores directory. Default: $DATA_DIR/scores")
-    parser.add_argument("--threshold", type=float, default=0.35, help="Scene cut threshold. Default: 0.35")
+    parser.add_argument("--threshold", type=float, default=0.09, help="Scene cut threshold. Default: 0.09")
     parser.add_argument("--stable-max", type=float, default=0.001, help="Max scene score for stable intro detection. Default: 0.001")
     parser.add_argument("--stable-seconds", type=float, default=2.0, help="Continuous stable seconds required after intro. Default: 2")
     parser.add_argument("--intro-search-seconds", type=float, default=15.0, help="Search range for intro end. Default: 15")
