@@ -164,6 +164,118 @@ def read_layout_staff_n(meta_path: Path) -> int | None:
     return max(values) if values else 0
 
 
+def layout_needs_frame_time_backfill(meta_path: Path) -> bool:
+    lines = meta_path.read_text(encoding="utf-8").splitlines()
+    for frame_lines in iter_layout_frame_blocks(lines):
+        has_start_seconds = any(line.strip().startswith("start_seconds:") for line in frame_lines)
+        has_source_time = any(line.strip().startswith("source_time:") for line in frame_lines)
+        has_source_seconds = any(line.strip().startswith("source_seconds:") for line in frame_lines)
+        if has_source_seconds or (has_source_time and not has_start_seconds):
+            return True
+    return False
+
+
+def iter_layout_frame_blocks(lines: list[str]) -> list[list[str]]:
+    in_layout = False
+    in_frames = False
+    blocks: list[list[str]] = []
+    current: list[str] | None = None
+    for line in lines:
+        if line == "layout:":
+            in_layout = True
+            in_frames = False
+            continue
+        if not in_layout:
+            continue
+        if line and not line.startswith(" "):
+            break
+        if line == "  frames:":
+            in_frames = True
+            continue
+        if not in_frames:
+            continue
+        if line.startswith("  ") and not line.startswith("    "):
+            break
+        if line == "    -":
+            if current is not None:
+                blocks.append(current)
+            current = [line]
+            continue
+        if current is not None:
+            current.append(line)
+    if current is not None:
+        blocks.append(current)
+    return blocks
+
+
+def backfill_meta_layout_frame_times(meta_path: Path, boundaries: list[float]) -> None:
+    lines = meta_path.read_text(encoding="utf-8").splitlines()
+    output: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if line == "  frames:":
+            output.append(line)
+            index += 1
+            while index < len(lines):
+                if lines[index].startswith("  ") and not lines[index].startswith("    "):
+                    break
+                if lines[index] != "    -":
+                    output.append(lines[index])
+                    index += 1
+                    continue
+                block = [lines[index]]
+                index += 1
+                while index < len(lines) and lines[index] != "    -" and not (lines[index].startswith("  ") and not lines[index].startswith("    ")):
+                    block.append(lines[index])
+                    index += 1
+                output.extend(backfill_layout_frame_block(block, boundaries))
+            continue
+        output.append(line)
+        index += 1
+    meta_path.write_text("\n".join(output).rstrip() + "\n", encoding="utf-8")
+
+
+def find_interval_start(snapshot_seconds: float, boundaries: list[float]) -> float | None:
+    for start, end in zip(boundaries[:-1], boundaries[1:]):
+        if start <= snapshot_seconds < end:
+            return start
+    if len(boundaries) >= 2 and snapshot_seconds == boundaries[-1]:
+        return boundaries[-2]
+    return None
+
+
+def backfill_layout_frame_block(block: list[str], boundaries: list[float]) -> list[str]:
+    snapshot_seconds: float | None = None
+    has_start_seconds = False
+    has_source_time = False
+    for line in block:
+        stripped = line.strip()
+        if stripped.startswith("source_seconds:") or stripped.startswith("snapshot_seconds:"):
+            try:
+                snapshot_seconds = float(stripped.split(":", 1)[1].strip())
+            except ValueError:
+                pass
+        elif stripped.startswith("start_seconds:"):
+            has_start_seconds = True
+        elif stripped.startswith("source_time:"):
+            has_source_time = True
+    start_seconds = find_interval_start(snapshot_seconds, boundaries) if snapshot_seconds is not None else None
+    output: list[str] = []
+    for line in block:
+        stripped = line.strip()
+        if stripped.startswith("source_time:"):
+            continue
+        if stripped.startswith("source_seconds:"):
+            output.append(line.replace("source_seconds:", "snapshot_seconds:", 1))
+            continue
+        output.append(line)
+        if stripped.startswith("segment_index:") and not has_start_seconds and has_source_time and start_seconds is not None:
+            output.append(f"      start_seconds: {round(start_seconds, 3)}")
+            output.append(f"      start_time: {yaml_quote(format_timestamp(start_seconds))}")
+    return output
+
+
 def layout_staff_n(layout: dict[str, Any]) -> int:
     values = []
     for frame in layout.get("frames") or []:
@@ -437,6 +549,8 @@ def build_score_image(video_path: Path, meta_path: Path, score_path: Path, args:
     has_layout = meta_has_layout(meta_path) if not args.no_layout else False
     if score_path.exists() and not args.overwrite and (args.no_layout or has_layout):
         if has_layout:
+            if layout_needs_frame_time_backfill(meta_path):
+                backfill_meta_layout_frame_times(meta_path, read_boundaries(meta_path))
             staff_n = read_layout_staff_n(meta_path)
             if staff_n is not None:
                 write_meta_staff_n(meta_path, staff_n)
@@ -465,8 +579,9 @@ def build_score_image(video_path: Path, meta_path: Path, score_path: Path, args:
                 rotate_frame(frame_path, theta)
                 layout_frames.append({
                     "segment_index": index,
-                    "source_seconds": round(midpoint, 3),
-                    "source_time": format_timestamp(midpoint),
+                    "start_seconds": round(start, 3),
+                    "start_time": format_timestamp(start),
+                    "snapshot_seconds": round(midpoint, 3),
                     **layout_summary,
                 })
             frame_paths.append(frame_path)
