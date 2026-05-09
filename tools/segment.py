@@ -354,26 +354,6 @@ def write_meta(meta_path: Path, video_id: str, duration: float, threshold: float
     meta_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def extract_audio(video_path: Path, audio_path: Path) -> None:
-    run_command([
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        "-i",
-        str(video_path),
-        "-vn",
-        "-ac",
-        "1",
-        "-ar",
-        "44100",
-        "-sample_fmt",
-        "s16",
-        str(audio_path),
-    ], capture=False)
-
-
 def build_score_image(video_path: Path, score_path: Path, boundaries: list[float]) -> None:
     segments = list(zip(boundaries[:-1], boundaries[1:]))
     if not segments:
@@ -429,7 +409,6 @@ def segment_video(video_path: Path, scores_dir: Path, args: argparse.Namespace) 
     video_id = video_id_from_path(video_path)
     sample_dir = scores_dir / video_id
     meta_path = sample_dir / "meta.yaml"
-    audio_path = sample_dir / "audio.wav"
     score_path = sample_dir / "score.webp"
     if meta_path.exists() and not args.overwrite:
         print(f"skip existing {video_id}")
@@ -471,8 +450,6 @@ def segment_video(video_path: Path, scores_dir: Path, args: argparse.Namespace) 
 
     sample_dir.mkdir(parents=True, exist_ok=True)
     write_meta(meta_path, video_id, duration, args.threshold, changes)
-    if args.audio and (args.overwrite or not audio_path.exists()):
-        extract_audio(video_path, audio_path)
     if args.score and (args.overwrite or not score_path.exists()):
         boundaries = [float(change["seconds"]) for change in changes]
         build_score_image(video_path, score_path, boundaries)
@@ -502,7 +479,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--score-filter-min-fraction", type=float, default=0.5, help="Minimum qualifying frame fraction for score filtering. Default: 0.5")
     parser.add_argument("--score-filter-diff-max", type=float, default=8.0, help="Reject if every sampled adjacent frame pair differs above this mean RGB delta. Default: 8")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing sample outputs.")
-    parser.add_argument("--audio", action="store_true", help="Also extract audio.wav.")
     parser.add_argument("--score", action="store_true", help="Also generate score.webp.")
     return parser.parse_args()
 
