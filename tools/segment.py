@@ -9,7 +9,6 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -354,57 +353,6 @@ def write_meta(meta_path: Path, video_id: str, duration: float, threshold: float
     meta_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def build_score_image(video_path: Path, score_path: Path, boundaries: list[float]) -> None:
-    segments = list(zip(boundaries[:-1], boundaries[1:]))
-    if not segments:
-        return
-    with tempfile.TemporaryDirectory(prefix="score_frames_", dir=PROJECT_ROOT / "temp") as temp_name:
-        temp_dir = Path(temp_name)
-        frame_paths: list[Path] = []
-        for index, (start, end) in enumerate(segments, start=1):
-            midpoint = start + (end - start) / 2
-            frame_path = temp_dir / f"frame_{index:02d}.webp"
-            run_command([
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-ss",
-                format_seconds(midpoint),
-                "-i",
-                str(video_path),
-                "-frames:v",
-                "1",
-                "-vf",
-                "scale=1440:-1",
-                str(frame_path),
-            ], capture=False)
-            frame_paths.append(frame_path)
-
-        inputs: list[str] = []
-        for frame_path in frame_paths:
-            inputs.extend(["-i", str(frame_path)])
-        filter_complex = "".join(f"[{index}:v]" for index in range(len(frame_paths))) + f"vstack=inputs={len(frame_paths)}[v]"
-        run_command([
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            *inputs,
-            "-filter_complex",
-            filter_complex,
-            "-map",
-            "[v]",
-            "-compression_level",
-            "6",
-            "-quality",
-            "90",
-            str(score_path),
-        ], capture=False)
-
-
 def segment_video(video_path: Path, scores_dir: Path, args: argparse.Namespace) -> None:
     video_id = video_id_from_path(video_path)
     meta_path = scores_dir / video_id / "meta.yaml"
@@ -422,7 +370,6 @@ def segment_video(video_path: Path, scores_dir: Path, args: argparse.Namespace) 
         return
 
     sample_dir = scores_dir / video_id
-    score_path = sample_dir / "score.webp"
     print(f"segment {video_id}: {video_path.name}", flush=True)
     samples = collect_scene_samples(video_path)
     windows = build_windows(samples, duration, args.window_seconds)
@@ -450,9 +397,6 @@ def segment_video(video_path: Path, scores_dir: Path, args: argparse.Namespace) 
 
     sample_dir.mkdir(parents=True, exist_ok=True)
     write_meta(meta_path, video_id, duration, args.threshold, changes)
-    if args.score and (args.overwrite or not score_path.exists()):
-        boundaries = [float(change["seconds"]) for change in changes]
-        build_score_image(video_path, score_path, boundaries)
     print(f"wrote {meta_path}", flush=True)
 
 
@@ -479,7 +423,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--score-filter-min-fraction", type=float, default=0.5, help="Minimum qualifying frame fraction for score filtering. Default: 0.5")
     parser.add_argument("--score-filter-diff-max", type=float, default=8.0, help="Reject if every sampled adjacent frame pair differs above this mean RGB delta. Default: 8")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing sample outputs.")
-    parser.add_argument("--score", action="store_true", help="Also generate score.webp.")
     return parser.parse_args()
 
 
