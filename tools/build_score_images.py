@@ -272,21 +272,39 @@ def summarize_staves(staves: dict[str, Any] | None) -> dict[str, Any] | None:
     }
 
 
-def summarize_layout(result: dict[str, Any]) -> dict[str, Any]:
+def crop_to_full_offset(source_size: dict[str, int], crop: dict[str, int], theta: float) -> tuple[float, float]:
+    left = float(crop["left"])
+    right = float(crop["right"])
+    full_width = float(source_size["width"])
+    cropped_width = full_width - left - right
+    crop_center_x = cropped_width / 2.0
+    full_center_x = full_width / 2.0
+    content_center_dx = crop_center_x + left - full_center_x
+    offset_x = full_center_x - crop_center_x + math.cos(theta) * content_center_dx
+    offset_y = math.sin(theta) * content_center_dx
+    return offset_x, offset_y
+
+
+def summarize_layout(result: dict[str, Any], *, source_size: dict[str, int] | None = None, crop: dict[str, int] | None = None) -> dict[str, Any]:
     if result.get("code") != 0:
         return {"code": result.get("code"), "message": result.get("message")}
     data = result.get("data") or []
     layout = data[0] if data else {}
     detection = layout.get("detection") or {}
     areas = detection.get("areas") or []
+    theta = float(layout.get("theta") or 0.0)
+    x_offset = 0.0
+    y_offset = 0.0
+    if source_size is not None and crop is not None:
+        x_offset, y_offset = crop_to_full_offset(source_size, crop, theta)
     staff_counts = [len(((area or {}).get("staves") or {}).get("middleRhos") or []) for area in areas]
     summarized_areas = []
     for area in areas:
         staves = (area or {}).get("staves") or {}
         middle_rhos = staves.get("middleRhos") or []
         summarized_area = {
-            "x": round(float(area.get("x", 0)), 2),
-            "y": round(float(area.get("y", 0)), 2),
+            "x": round(float(area.get("x", 0)) + x_offset, 2),
+            "y": round(float(area.get("y", 0)) + y_offset, 2),
             "width": round(float(area.get("width", 0)), 2),
             "height": round(float(area.get("height", 0)), 2),
             "staves": len(middle_rhos),
@@ -296,7 +314,7 @@ def summarize_layout(result: dict[str, Any]) -> dict[str, Any]:
             summarized_area["staff_detection"] = staff_detection
         summarized_areas.append(summarized_area)
     return {
-        "sourceSize": layout.get("sourceSize"),
+        "sourceSize": source_size or layout.get("sourceSize"),
         "theta": layout.get("theta"),
         "interval": layout.get("interval"),
         "systems": len(areas),
@@ -304,6 +322,31 @@ def summarize_layout(result: dict[str, Any]) -> dict[str, Any]:
         "totalStaves": sum(staff_counts),
         "areas": summarized_areas,
     }
+
+
+def crop_black_side_blocks(frame_path: Path, threshold: float) -> dict[str, int]:
+    image = Image.open(frame_path).convert("RGB")
+    pixels = image.load()
+    width, height = image.size
+
+    def column_mean(x: int) -> float:
+        total = 0.0
+        for y in range(height):
+            red, green, blue = pixels[x, y]
+            total += (red + green + blue) / 3.0
+        return total / height
+
+    left = 0
+    while left < width and column_mean(left) <= threshold:
+        left += 1
+    right = width - 1
+    while right >= left and column_mean(right) <= threshold:
+        right -= 1
+    right_width = width - right - 1
+
+    if left or right_width:
+        image.crop((left, 0, right + 1, height)).save(frame_path)
+    return {"left": left, "right": right_width}
 
 
 def rotate_frame(frame_path: Path, theta: float) -> None:
@@ -413,8 +456,11 @@ def build_score_image(video_path: Path, meta_path: Path, score_path: Path, args:
                 frame_size = image_size(frame_path)
             layout_summary: dict[str, Any] | None = None
             if not args.no_layout:
-                result = post_layout(args.layout_api_url, frame_path, args.layout_timeout)
-                layout_summary = summarize_layout(result)
+                layout_frame_path = temp_dir / f"frame_{index:02d}_layout.png"
+                layout_frame_path.write_bytes(frame_path.read_bytes())
+                crop = crop_black_side_blocks(layout_frame_path, args.black_side_threshold)
+                result = post_layout(args.layout_api_url, layout_frame_path, args.layout_timeout)
+                layout_summary = summarize_layout(result, source_size=frame_size, crop=crop)
                 theta = float(layout_summary.get("theta") or 0.0)
                 rotate_frame(frame_path, theta)
                 layout_frames.append({
@@ -446,6 +492,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--score-width", type=int, default=1440, help="Width of frames stacked into score.webp. Default: 1440")
     parser.add_argument("--layout-api-url", help="Layout API URL. Default: $LAYOUT_API_URL or local Starry omr-service")
     parser.add_argument("--layout-timeout", type=float, default=120.0, help="Layout API timeout in seconds. Default: 120")
+    parser.add_argument("--black-side-threshold", type=float, default=8.0, help="Column mean threshold for cropping black side blocks before layout detection. Default: 8")
     parser.add_argument("--no-layout", action="store_true", help="Build legacy score.webp without layout API calls or metadata updates.")
     return parser.parse_args()
 
