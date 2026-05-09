@@ -202,6 +202,10 @@ def read_meta(meta_path: Path) -> dict[str, Any]:
     return meta
 
 
+def has_staff_layout(meta_path: Path) -> bool:
+    return any(line.startswith("staffLayout:") for line in meta_path.read_text(encoding="utf-8").splitlines())
+
+
 def yaml_quote(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
@@ -502,10 +506,12 @@ def infer_staff_layout(systems: list[SystemLayout]) -> tuple[str, list[SystemLay
 
 
 def process_sample(video_id: str, video_path: Path, meta_path: Path, args: argparse.Namespace) -> dict[str, Any]:
+    print(f"process {video_id}", flush=True)
     meta = read_meta(meta_path)
     systems = layout_systems(meta)
     if not systems:
         raise SystemExit(f"No layout systems found in {meta_path}")
+    print(f"extract {video_id}: frames={len(set(system.frame_index for system in systems))} systems={len(systems)}", flush=True)
     with tempfile.TemporaryDirectory(prefix="brackets_", dir=PROJECT_ROOT / "temp") as temp_name:
         temp_dir = Path(temp_name)
         by_frame: dict[int, list[SystemLayout]] = {}
@@ -524,6 +530,7 @@ def process_sample(video_id: str, video_path: Path, meta_path: Path, args: argpa
                 crop_bracket_image(corrected, system, bracket_path)
                 bracket_paths.append(bracket_path)
                 path_systems.append(system)
+        print(f"predict {video_id}: crops={len(bracket_paths)}", flush=True)
         brackets = predict_brackets(args.brackets_predictor, bracket_paths, args.timeout)
         for system, bracket, path in zip(path_systems, brackets, bracket_paths):
             system.brackets = bracket
@@ -536,6 +543,7 @@ def process_sample(video_id: str, video_path: Path, meta_path: Path, args: argpa
     staff_layout_code, systems = infer_staff_layout(systems)
     attach_bracket_results(meta, staff_layout_code, systems)
     write_meta(meta_path, meta)
+    print(f"done {video_id}: staffLayout={staff_layout_code}", flush=True)
     return {
         "video_id": video_id,
         "staffLayoutCode": staff_layout_code,
@@ -568,6 +576,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--brackets-predictor", help=f"ZeroMQ brackets predictor address. Default: ${BRACKETS_PREDICTOR_ENV} or tcp://localhost:12028")
     parser.add_argument("--timeout", type=float, default=300.0, help="Predictor timeout in seconds. Default: 300")
     parser.add_argument("--output", type=Path, help="Write JSON result to this path instead of stdout")
+    parser.add_argument("--overwrite", action="store_true", help="Reprocess samples that already have top-level staffLayout")
     parser.add_argument("--save-debug", action="store_true", help="Save per-system bracket crop images under each score directory")
     return parser.parse_args()
 
@@ -582,16 +591,29 @@ def main() -> None:
     args.brackets_predictor = args.brackets_predictor or os.environ.get(BRACKETS_PREDICTOR_ENV) or DEFAULT_BRACKETS_PREDICTOR
     wanted = set(args.video_id) if args.video_id else None
     samples = []
+    skipped = 0
     for meta_path in sorted(scores_dir.glob("*/meta.yaml")):
         video_id = meta_path.parent.name
         if wanted is not None and video_id not in wanted:
             continue
+        if not args.overwrite and has_staff_layout(meta_path):
+            print(f"skip existing staffLayout {video_id}", flush=True)
+            skipped += 1
+            continue
         video_path = find_video(video_dir, video_id)
-        if video_path is not None:
-            samples.append((video_id, video_path, meta_path))
+        if video_path is None:
+            print(f"skip missing video {video_id}", flush=True)
+            continue
+        samples.append((video_id, video_path, meta_path))
     if args.limit is not None:
         samples = samples[: args.limit]
-    results = [process_sample(video_id, video_path, meta_path, args) for video_id, video_path, meta_path in samples]
+    total = len(samples)
+    print(f"selected {total} samples, skipped_existing={skipped}, overwrite={args.overwrite}", flush=True)
+    results = []
+    for index, (video_id, video_path, meta_path) in enumerate(samples, start=1):
+        print(f"[{index}/{total}] start {video_id}", flush=True)
+        results.append(process_sample(video_id, video_path, meta_path, args))
+    print(f"finished processed={len(results)} skipped_existing={skipped}", flush=True)
     text = json.dumps(results, ensure_ascii=False, indent=2)
     if args.output:
         args.output.expanduser().resolve().write_text(text + "\n", encoding="utf-8")
