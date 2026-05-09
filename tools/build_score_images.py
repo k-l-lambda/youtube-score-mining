@@ -113,9 +113,62 @@ def read_boundaries(meta_path: Path) -> list[float]:
         match = SECONDS_RE.match(line)
         if match is not None:
             boundaries.append(float(match.group(1)))
-    if len(boundaries) < 2:
-        raise SystemExit(f"Need at least two shot_detection changes in {meta_path}")
     return boundaries
+
+
+def read_layout_frame_times(meta_path: Path) -> list[tuple[int, float, float]]:
+    frames: list[tuple[int, float, float]] = []
+    current_segment: int | None = None
+    current_start: float | None = None
+    current_snapshot: float | None = None
+    in_layout = False
+    in_frames = False
+
+    def append_current() -> None:
+        if current_segment is not None and current_start is not None and current_snapshot is not None:
+            frames.append((current_segment, current_start, current_snapshot))
+
+    for line in meta_path.read_text(encoding="utf-8").splitlines():
+        if line == "layout:":
+            in_layout = True
+            in_frames = False
+            continue
+        if not in_layout:
+            continue
+        if line and not line.startswith(" "):
+            break
+        if line == "  frames:":
+            in_frames = True
+            continue
+        if not in_frames:
+            continue
+        if line.startswith("  ") and not line.startswith("    "):
+            break
+        if line == "    -":
+            append_current()
+            current_segment = None
+            current_start = None
+            current_snapshot = None
+            continue
+        stripped = line.strip()
+        if stripped.startswith("segment_index:"):
+            current_segment = int(stripped.split(":", 1)[1].strip())
+        elif stripped.startswith("start_seconds:"):
+            current_start = float(stripped.split(":", 1)[1].strip())
+        elif stripped.startswith("snapshot_seconds:"):
+            current_snapshot = float(stripped.split(":", 1)[1].strip())
+    append_current()
+    return frames
+
+
+def segment_times(meta_path: Path) -> list[tuple[int, float, float]]:
+    boundaries = read_boundaries(meta_path)
+    if len(boundaries) >= 2:
+        return [(index, start, start + (end - start) / 2) for index, (start, end) in enumerate(zip(boundaries[:-1], boundaries[1:]), start=1)]
+    frames = read_layout_frame_times(meta_path)
+    if frames:
+        return frames
+    raise SystemExit(f"Need shot_detection changes or existing layout frame times in {meta_path}")
 
 
 def strip_existing_generated_fields(meta_text: str) -> str:
@@ -454,6 +507,8 @@ def crop_black_side_blocks(frame_path: Path, threshold: float) -> dict[str, int]
     right = width - 1
     while right >= left and column_mean(right) <= threshold:
         right -= 1
+    if left >= width or right < left:
+        return {"left": 0, "right": 0}
     right_width = width - right - 1
 
     if left or right_width:
@@ -473,76 +528,117 @@ def image_size(image_path: Path) -> dict[str, int]:
     return {"width": image.width, "height": image.height}
 
 
-def score_part_path(score_path: Path, part_index: int) -> Path:
-    if part_index == 1:
-        return score_path
-    return score_path.with_name(f"{score_path.stem}{part_index}{score_path.suffix}")
+def layout_has_score_grid_rows(meta_path: Path) -> bool:
+    return any(line.strip().startswith("score_grid_rows:") for line in meta_path.read_text(encoding="utf-8").splitlines())
 
 
-def split_frame_paths(frame_paths: list[Path]) -> list[list[Path]]:
-    parts: list[list[Path]] = []
-    current: list[Path] = []
-    current_height = 0
-    for frame_path in frame_paths:
-        size = image_size(frame_path)
-        frame_height = size["height"]
-        if current and current_height + frame_height > WEBP_MAX_DIMENSION:
-            parts.append(current)
-            current = []
-            current_height = 0
-        current.append(frame_path)
-        current_height += frame_height
-    if current:
-        parts.append(current)
-    return parts
+def backfill_meta_score_grid_rows(meta_path: Path) -> None:
+    rows = len(read_layout_frame_times(meta_path))
+    if rows <= 0 or layout_has_score_grid_rows(meta_path):
+        return
+    lines = meta_path.read_text(encoding="utf-8").splitlines()
+    output: list[str] = []
+    inserted = False
+    for line in lines:
+        output.append(line)
+        if line == "  frame_size:":
+            continue
+        if not inserted and line == "layout:":
+            output.append(f"  score_grid_rows: {rows}")
+            inserted = True
+    meta_path.write_text("\n".join(output).rstrip() + "\n", encoding="utf-8")
 
 
-def build_stacked_score(frame_paths: list[Path], score_path: Path) -> list[Path]:
+def read_layout_bracket_results(meta_path: Path) -> dict[tuple[int, int], dict[str, Any]]:
+    results: dict[tuple[int, int], dict[str, Any]] = {}
+    in_layout = False
+    in_frames = False
+    frame_index = 0
+    area_index = 0
+    current_area: dict[str, Any] | None = None
+
+    def flush_area() -> None:
+        if current_area and ("bracketsAppearance" in current_area or "staffMask" in current_area):
+            results[(frame_index, area_index)] = dict(current_area)
+
+    for line in meta_path.read_text(encoding="utf-8").splitlines():
+        if line == "layout:":
+            in_layout = True
+            in_frames = False
+            continue
+        if not in_layout:
+            continue
+        if line and not line.startswith(" "):
+            break
+        if line == "  frames:":
+            in_frames = True
+            continue
+        if not in_frames:
+            continue
+        if line.startswith("  ") and not line.startswith("    "):
+            break
+        stripped = line.strip()
+        if line == "    -":
+            flush_area()
+            frame_index += 1
+            area_index = 0
+            current_area = None
+            continue
+        if line == "        -":
+            flush_area()
+            area_index += 1
+            current_area = {}
+            continue
+        if current_area is None:
+            continue
+        if stripped.startswith("bracketsAppearance:"):
+            current_area["bracketsAppearance"] = json.loads(stripped.split(":", 1)[1].strip())
+        elif stripped.startswith("staffMask:"):
+            value = stripped.split(":", 1)[1].strip()
+            current_area["staffMask"] = None if value == "null" else int(value)
+    flush_area()
+    return results
+
+
+def restore_layout_bracket_results(layout_frames: list[dict[str, Any]], bracket_results: dict[tuple[int, int], dict[str, Any]]) -> None:
+    for frame_index, frame in enumerate(layout_frames, start=1):
+        for area_index, area in enumerate(frame.get("areas") or [], start=1):
+            result = bracket_results.get((frame_index, area_index))
+            if result:
+                area.update(result)
+
+
+def score_grid_rows(frame_count: int, frame_size: dict[str, int]) -> int:
+    if frame_count <= 0:
+        return 0
+    frame_height = frame_size["height"]
+    max_rows = WEBP_MAX_DIMENSION // frame_height
+    if max_rows < 1:
+        raise ValueError(f"frame height {frame_height} exceeds WebP max dimension {WEBP_MAX_DIMENSION}")
+    columns = math.ceil(frame_count / max_rows)
+    return math.ceil(frame_count / columns)
+
+
+def build_score_grid(frame_paths: list[Path], score_path: Path, frame_size: dict[str, int]) -> tuple[list[Path], int]:
     if not frame_paths:
-        return []
-    written_paths = []
-    for part_index, part_frame_paths in enumerate(split_frame_paths(frame_paths), start=1):
-        output_path = score_part_path(score_path, part_index)
-        score_path.parent.mkdir(parents=True, exist_ok=True)
-        if len(part_frame_paths) == 1:
-            run_command([
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-i",
-                str(part_frame_paths[0]),
-                "-compression_level",
-                "6",
-                "-quality",
-                "90",
-                str(output_path),
-            ], capture=False)
-        else:
-            inputs: list[str] = []
-            for frame_path in part_frame_paths:
-                inputs.extend(["-i", str(frame_path)])
-            filter_complex = "".join(f"[{index}:v]" for index in range(len(part_frame_paths))) + f"vstack=inputs={len(part_frame_paths)}[v]"
-            run_command([
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                *inputs,
-                "-filter_complex",
-                filter_complex,
-                "-map",
-                "[v]",
-                "-compression_level",
-                "6",
-                "-quality",
-                "90",
-                str(output_path),
-            ], capture=False)
-        written_paths.append(output_path)
-    return written_paths
+        return [], 0
+    rows = score_grid_rows(len(frame_paths), frame_size)
+    columns = math.ceil(len(frame_paths) / rows)
+    output_width = frame_size["width"] * columns
+    output_height = frame_size["height"] * rows
+    if output_width > WEBP_MAX_DIMENSION:
+        raise ValueError(f"score grid width {output_width} exceeds WebP max dimension {WEBP_MAX_DIMENSION}")
+    if output_height > WEBP_MAX_DIMENSION:
+        raise ValueError(f"score grid height {output_height} exceeds WebP max dimension {WEBP_MAX_DIMENSION}")
+    image = Image.new("RGB", (output_width, output_height), "black")
+    for index, frame_path in enumerate(frame_paths):
+        row = index % rows
+        column = index // rows
+        with Image.open(frame_path).convert("RGB") as frame:
+            image.paste(frame, (column * frame_size["width"], row * frame_size["height"]))
+    score_path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(score_path, format="WEBP", quality=90, method=6)
+    return [score_path], rows
 
 
 def build_score_image(video_path: Path, meta_path: Path, score_path: Path, args: argparse.Namespace) -> None:
@@ -551,19 +647,21 @@ def build_score_image(video_path: Path, meta_path: Path, score_path: Path, args:
         if has_layout:
             if layout_needs_frame_time_backfill(meta_path):
                 backfill_meta_layout_frame_times(meta_path, read_boundaries(meta_path))
+            if not layout_has_score_grid_rows(meta_path):
+                backfill_meta_score_grid_rows(meta_path)
             staff_n = read_layout_staff_n(meta_path)
             if staff_n is not None:
                 write_meta_staff_n(meta_path, staff_n)
         print(f"skip existing score {meta_path.parent.name}", flush=True)
         return
-    boundaries = read_boundaries(meta_path)
+    segment_frames = segment_times(meta_path)
+    bracket_results = read_layout_bracket_results(meta_path)
     layout_frames = []
     frame_size: dict[str, int] | None = None
     with tempfile.TemporaryDirectory(prefix="score_frames_", dir=PROJECT_ROOT / "temp") as temp_name:
         temp_dir = Path(temp_name)
         frame_paths: list[Path] = []
-        for index, (start, end) in enumerate(zip(boundaries[:-1], boundaries[1:]), start=1):
-            midpoint = start + (end - start) / 2
+        for index, start, midpoint in segment_frames:
             frame_path = temp_dir / f"frame_{index:02d}.png"
             extract_frame(video_path, midpoint, frame_path, args.score_width)
             if frame_size is None:
@@ -585,11 +683,16 @@ def build_score_image(video_path: Path, meta_path: Path, score_path: Path, args:
                     **layout_summary,
                 })
             frame_paths.append(frame_path)
-        written_paths = build_stacked_score(frame_paths, score_path)
+        try:
+            written_paths, grid_rows = build_score_grid(frame_paths, score_path, frame_size or image_size(frame_paths[0]))
+        except ValueError as exc:
+            print(f"skip {meta_path.parent.name}: {exc}", flush=True)
+            return
     if not args.no_layout:
+        restore_layout_bracket_results(layout_frames, bracket_results)
         write_meta_layout(meta_path, {
             "frame_size": frame_size,
-            "score_images": [path.name for path in written_paths],
+            "score_grid_rows": grid_rows,
             "frames": layout_frames,
         })
     print(f"wrote {', '.join(str(path) for path in written_paths)}", flush=True)
