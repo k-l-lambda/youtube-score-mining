@@ -118,13 +118,71 @@ def read_boundaries(meta_path: Path) -> list[float]:
     return boundaries
 
 
-def strip_existing_layout(meta_text: str) -> str:
+def strip_existing_generated_fields(meta_text: str) -> str:
     lines = meta_text.rstrip().splitlines()
-    for index, line in enumerate(lines):
+    kept = []
+    for line in lines:
         if line == "layout:":
-            return "\n".join(lines[:index]).rstrip()
-    return "\n".join(lines).rstrip()
+            break
+        if line.startswith("staff_n:"):
+            continue
+        kept.append(line)
+    return "\n".join(kept).rstrip()
 
+
+def meta_has_layout(meta_path: Path) -> bool:
+    return any(line == "layout:" for line in meta_path.read_text(encoding="utf-8").splitlines())
+
+
+def read_layout_staff_n(meta_path: Path) -> int | None:
+    lines = meta_path.read_text(encoding="utf-8").splitlines()
+    in_layout = False
+    in_staves_per_system = False
+    values: list[int] = []
+    for line in lines:
+        if line == "layout:":
+            in_layout = True
+            in_staves_per_system = False
+            continue
+        if not in_layout:
+            continue
+        if line and not line.startswith(" "):
+            break
+        stripped = line.strip()
+        if stripped == "stavesPerSystem:":
+            in_staves_per_system = True
+            continue
+        if in_staves_per_system:
+            if stripped.startswith("- "):
+                try:
+                    values.append(int(stripped[2:].strip()))
+                except ValueError:
+                    pass
+                continue
+            if stripped and not stripped.startswith("-"):
+                in_staves_per_system = False
+    return max(values) if values else 0
+
+
+def layout_staff_n(layout: dict[str, Any]) -> int:
+    values = []
+    for frame in layout.get("frames") or []:
+        values.extend(int(value) for value in (frame.get("stavesPerSystem") or []))
+    return max(values) if values else 0
+
+
+def write_meta_layout(meta_path: Path, layout: dict[str, Any]) -> None:
+    base = strip_existing_generated_fields(meta_path.read_text(encoding="utf-8"))
+    layout_text = "\n".join(yaml_lines({"layout": layout}))
+    meta_path.write_text(f"{base}\nstaff_n: {layout_staff_n(layout)}\n{layout_text}\n", encoding="utf-8")
+
+
+def write_meta_staff_n(meta_path: Path, staff_n: int) -> None:
+    meta_text = meta_path.read_text(encoding="utf-8")
+    base = strip_existing_generated_fields(meta_text)
+    layout_index = meta_text.rstrip().splitlines().index("layout:")
+    layout_text = "\n".join(meta_text.rstrip().splitlines()[layout_index:])
+    meta_path.write_text(f"{base}\nstaff_n: {staff_n}\n{layout_text}\n", encoding="utf-8")
 
 def yaml_quote(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
@@ -162,11 +220,6 @@ def yaml_lines(value: Any, indent: int = 0) -> list[str]:
         return lines
     return [f"{prefix}{yaml_scalar(value)}"]
 
-
-def write_meta_layout(meta_path: Path, layout: dict[str, Any]) -> None:
-    base = strip_existing_layout(meta_path.read_text(encoding="utf-8"))
-    layout_text = "\n".join(yaml_lines({"layout": layout}))
-    meta_path.write_text(f"{base}\n{layout_text}\n", encoding="utf-8")
 
 
 def extract_frame(video_path: Path, seconds: float, frame_path: Path, width: int) -> None:
@@ -338,7 +391,12 @@ def build_stacked_score(frame_paths: list[Path], score_path: Path) -> list[Path]
 
 
 def build_score_image(video_path: Path, meta_path: Path, score_path: Path, args: argparse.Namespace) -> None:
-    if score_path.exists() and not args.overwrite:
+    has_layout = meta_has_layout(meta_path) if not args.no_layout else False
+    if score_path.exists() and not args.overwrite and (args.no_layout or has_layout):
+        if has_layout:
+            staff_n = read_layout_staff_n(meta_path)
+            if staff_n is not None:
+                write_meta_staff_n(meta_path, staff_n)
         print(f"skip existing score {meta_path.parent.name}", flush=True)
         return
     boundaries = read_boundaries(meta_path)
