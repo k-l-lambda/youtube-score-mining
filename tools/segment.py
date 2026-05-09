@@ -407,9 +407,7 @@ def build_score_image(video_path: Path, score_path: Path, boundaries: list[float
 
 def segment_video(video_path: Path, scores_dir: Path, args: argparse.Namespace) -> None:
     video_id = video_id_from_path(video_path)
-    sample_dir = scores_dir / video_id
-    meta_path = sample_dir / "meta.yaml"
-    score_path = sample_dir / "score.webp"
+    meta_path = scores_dir / video_id / "meta.yaml"
     if meta_path.exists() and not args.overwrite:
         print(f"skip existing {video_id}")
         return
@@ -423,6 +421,8 @@ def segment_video(video_path: Path, scores_dir: Path, args: argparse.Namespace) 
         print(f"pass score-filter {video_id}", flush=True)
         return
 
+    sample_dir = scores_dir / video_id
+    score_path = sample_dir / "score.webp"
     print(f"segment {video_id}: {video_path.name}", flush=True)
     samples = collect_scene_samples(video_path)
     windows = build_windows(samples, duration, args.window_seconds)

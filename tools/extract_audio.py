@@ -154,10 +154,14 @@ def transcribe_audio(audio_path: Path, midi_path: Path, weight_path: Path, conf_
 def process_video(video_path: Path, scores_dir: Path, overwrite: bool, midi: bool, weight_path: Path, conf_path: Path, device: str) -> tuple[bool, bool]:
     video_id = video_id_from_path(video_path)
     sample_dir = scores_dir / video_id
+    meta_path = sample_dir / "meta.yaml"
     audio_path = sample_dir / "audio.wav"
     midi_path = sample_dir / DEFAULT_MIDI_NAME
     audio_written = False
     midi_written = False
+    if not meta_path.is_file():
+        print(f"skip missing meta {video_id}", flush=True)
+        return audio_written, midi_written
     if audio_path.exists() and not overwrite:
         print(f"skip existing audio {video_id}", flush=True)
     else:
