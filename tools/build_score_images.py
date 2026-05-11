@@ -529,6 +529,16 @@ def image_size(image_path: Path) -> dict[str, int]:
     return {"width": image.width, "height": image.height}
 
 
+def mean_resized_gray_diff(first_path: Path, second_path: Path, width: int) -> float:
+    with Image.open(first_path).convert("L") as first, Image.open(second_path).convert("L") as second:
+        height = max(1, round(width * first.height / first.width))
+        first_small = first.resize((width, height), Image.Resampling.BILINEAR)
+        second_small = second.resize((width, height), Image.Resampling.BILINEAR)
+        first_pixels = first_small.tobytes()
+        second_pixels = second_small.tobytes()
+    return sum(abs(left - right) for left, right in zip(first_pixels, second_pixels)) / len(first_pixels)
+
+
 def layout_has_score_grid_rows(meta_path: Path) -> bool:
     return any(line.strip().startswith("score_grid_rows:") for line in meta_path.read_text(encoding="utf-8").splitlines())
 
@@ -662,6 +672,7 @@ def build_score_image(video_path: Path, meta_path: Path, score_path: Path, args:
     with tempfile.TemporaryDirectory(prefix="score_frames_", dir=PROJECT_ROOT / "temp") as temp_name:
         temp_dir = Path(temp_name)
         frame_paths: list[Path] = []
+        kept_frame_path: Path | None = None
         for index, start, midpoint in segment_frames:
             frame_path = temp_dir / f"frame_{index:02d}.png"
             if not extract_frame(video_path, midpoint, frame_path, args.score_width):
@@ -669,6 +680,11 @@ def build_score_image(video_path: Path, meta_path: Path, score_path: Path, args:
                 return
             if frame_size is None:
                 frame_size = image_size(frame_path)
+            if kept_frame_path is not None:
+                frame_diff = mean_resized_gray_diff(kept_frame_path, frame_path, args.dedup_width)
+                if frame_diff < args.dedup_diff_threshold:
+                    print(f"drop duplicate frame {meta_path.parent.name}: segment {index} diff={frame_diff:.4f}", flush=True)
+                    continue
             layout_summary: dict[str, Any] | None = None
             if not args.no_layout:
                 layout_frame_path = temp_dir / f"frame_{index:02d}_layout.png"
@@ -686,6 +702,7 @@ def build_score_image(video_path: Path, meta_path: Path, score_path: Path, args:
                     **layout_summary,
                 })
             frame_paths.append(frame_path)
+            kept_frame_path = frame_path
         try:
             written_paths, grid_rows = build_score_grid(frame_paths, score_path, frame_size or image_size(frame_paths[0]))
         except ValueError as exc:
@@ -714,6 +731,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--layout-api-url", help="Layout API URL. Default: $LAYOUT_API_URL or local Starry omr-service")
     parser.add_argument("--layout-timeout", type=float, default=120.0, help="Layout API timeout in seconds. Default: 120")
     parser.add_argument("--black-side-threshold", type=float, default=8.0, help="Column mean threshold for cropping black side blocks before layout detection. Default: 8")
+    parser.add_argument("--dedup-diff-threshold", type=float, default=1.0, help="Drop a frame when its mean resized grayscale diff from the last kept frame is below this value. Default: 1")
+    parser.add_argument("--dedup-width", type=int, default=160, help="Width for duplicate frame comparison. Default: 160")
     parser.add_argument("--no-layout", action="store_true", help="Build legacy score.webp without layout API calls or metadata updates.")
     return parser.parse_args()
 
