@@ -47,6 +47,19 @@ class FramePairStats:
     diff: float
 
 
+@dataclass(frozen=True)
+class AdjacentFrameDiff:
+    frame_index: int
+    seconds: float
+    diff: float
+
+
+@dataclass(frozen=True)
+class FlatRegion:
+    start: float
+    end: float
+
+
 def load_env(env_path: Path, *, override: bool = False) -> None:
     if not env_path.exists():
         return
@@ -311,6 +324,77 @@ def find_final_frame_before_outro(windows: list[TimeWindow], duration: float, st
     return duration
 
 
+def collect_adjacent_frame_diffs(video_path: Path, duration: float, width: int, height: int) -> list[AdjacentFrameDiff]:
+    proc = subprocess.Popen([
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(video_path),
+        "-vf",
+        f"scale={width}:{height},format=gray",
+        "-f",
+        "rawvideo",
+        "-",
+    ], stdout=subprocess.PIPE)
+    frame_size = width * height
+    previous: bytes | None = None
+    frame_index = 0
+    diffs: list[AdjacentFrameDiff] = []
+    while True:
+        chunk = proc.stdout.read(frame_size) if proc.stdout else b""
+        if not chunk:
+            break
+        if len(chunk) != frame_size:
+            break
+        if previous is not None:
+            diff = sum(abs(left - right) for left, right in zip(chunk, previous)) / frame_size
+            diffs.append(AdjacentFrameDiff(frame_index, 0.0, diff))
+        previous = chunk
+        frame_index += 1
+    exit_code = proc.wait()
+    if exit_code:
+        raise SystemExit(f"ffmpeg failed with exit code {exit_code}: {video_path}")
+    frame_count = frame_index
+    if frame_count < 2:
+        return []
+    return [AdjacentFrameDiff(item.frame_index, item.frame_index * duration / max(frame_count - 1, 1), item.diff) for item in diffs]
+
+
+def adjacent_diff_threshold(diffs: list[AdjacentFrameDiff], bin_count: int, ratio: float) -> float | None:
+    if not diffs or bin_count <= 0:
+        return None
+    max_diff = max(item.diff for item in diffs)
+    if max_diff <= 0:
+        return 0.0
+    counts = [0] * bin_count
+    bin_width = max_diff / bin_count
+    for item in diffs:
+        counts[min(int(item.diff / bin_width), bin_count - 1)] += 1
+    best_index = max(range(bin_count), key=lambda index: counts[index])
+    return (best_index + 1) * bin_width
+
+
+def find_flat_regions(diffs: list[AdjacentFrameDiff], threshold: float, min_seconds: float) -> list[FlatRegion]:
+    regions: list[FlatRegion] = []
+    start: float | None = None
+    last: float | None = None
+    for item in diffs:
+        if item.diff <= threshold:
+            if start is None:
+                start = item.seconds
+            last = item.seconds
+        else:
+            if start is not None and last is not None and last - start > min_seconds:
+                regions.append(FlatRegion(start, last))
+            start = None
+            last = None
+    if start is not None and last is not None and last - start > min_seconds:
+        regions.append(FlatRegion(start, last))
+    return regions
+
+
 def format_timestamp(seconds: float) -> str:
     millis = round((seconds - int(seconds)) * 1000)
     total_seconds = int(seconds)
@@ -378,22 +462,43 @@ def segment_video(video_path: Path, scores_dir: Path, args: argparse.Namespace) 
     if final_frame <= stable_start:
         final_frame = duration
 
-    cuts = [sample for sample in samples if stable_start < sample.seconds < final_frame and sample.score > args.threshold]
-    changes: list[dict[str, str | float]] = [{
-        "time": format_timestamp(stable_start),
-        "seconds": stable_start,
-        "role": "stable_start_after_intro",
-    }]
-    changes.extend({
-        "time": format_timestamp(sample.seconds),
-        "seconds": sample.seconds,
-        "score": sample.score,
-    } for sample in cuts)
-    changes.append({
-        "time": format_timestamp(final_frame),
-        "seconds": final_frame,
-        "role": "final_frame_before_outro",
-    })
+    changes: list[dict[str, str | float]] = []
+    adjacent_diffs = collect_adjacent_frame_diffs(video_path, duration, args.adjacent_diff_width, args.adjacent_diff_height)
+    adjacent_threshold = adjacent_diff_threshold(adjacent_diffs, args.adjacent_diff_bins, args.adjacent_diff_ratio)
+    flat_regions = find_flat_regions(adjacent_diffs, adjacent_threshold, args.adjacent_diff_min_flat_seconds) if adjacent_threshold is not None else []
+    bounded_regions = [region for region in flat_regions if region.end > stable_start and region.start < final_frame]
+    if bounded_regions:
+        changes.append({
+            "time": format_timestamp(max(bounded_regions[0].start, stable_start)),
+            "seconds": max(bounded_regions[0].start, stable_start),
+            "role": "stable_start_after_intro",
+        })
+        for region in bounded_regions[:-1]:
+            boundary = min(region.end, final_frame)
+            if boundary > float(changes[-1]["seconds"]):
+                changes.append({
+                    "time": format_timestamp(boundary),
+                    "seconds": boundary,
+                    "score": adjacent_threshold,
+                })
+        final_boundary = min(bounded_regions[-1].end, final_frame)
+        if final_boundary > float(changes[-1]["seconds"]):
+            changes.append({
+                "time": format_timestamp(final_boundary),
+                "seconds": final_boundary,
+                "role": "final_frame_before_outro",
+            })
+    else:
+        changes.append({
+            "time": format_timestamp(stable_start),
+            "seconds": stable_start,
+            "role": "stable_start_after_intro",
+        })
+        changes.append({
+            "time": format_timestamp(final_frame),
+            "seconds": final_frame,
+            "role": "final_frame_before_outro",
+        })
 
     sample_dir.mkdir(parents=True, exist_ok=True)
     write_meta(meta_path, video_id, duration, args.threshold, changes)
@@ -413,6 +518,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--intro-change-threshold", type=float, default=0.05, help="Scene score treated as intro motion. Default: 0.05")
     parser.add_argument("--window-seconds", type=float, default=5.0, help="Window size for outro detection. Default: 5")
     parser.add_argument("--minimum-outro-seconds", type=float, default=10.0, help="Minimum trailing stable duration to mark outro. Default: 10")
+    parser.add_argument("--adjacent-diff-bins", type=int, default=120, help="Histogram bins for adjacent-frame flat-region thresholding. Default: 120")
+    parser.add_argument("--adjacent-diff-ratio", type=float, default=10.0, help=argparse.SUPPRESS)
+    parser.add_argument("--adjacent-diff-min-flat-seconds", type=float, default=2.0, help="Minimum duration for a score flat region. Default: 2")
+    parser.add_argument("--adjacent-diff-width", type=int, default=160, help="Scaled grayscale width for adjacent-frame differences. Default: 160")
+    parser.add_argument("--adjacent-diff-height", type=int, default=90, help="Scaled grayscale height for adjacent-frame differences. Default: 90")
     parser.add_argument("--limit", type=int, help="Process at most this many videos.")
     parser.add_argument("--video-id", action="append", help="Only process this video ID. Can be used multiple times.")
     parser.add_argument("--score-filter-only", action="store_true", help="Only run the score-video filter without generating sample outputs.")
