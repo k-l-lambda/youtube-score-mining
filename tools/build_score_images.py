@@ -387,7 +387,7 @@ def yaml_lines(value: Any, indent: int = 0) -> list[str]:
 
 
 
-def extract_frame(video_path: Path, seconds: float, frame_path: Path, width: int) -> None:
+def extract_frame(video_path: Path, seconds: float, frame_path: Path, width: int) -> bool:
     run_command([
         "ffmpeg",
         "-hide_banner",
@@ -404,6 +404,7 @@ def extract_frame(video_path: Path, seconds: float, frame_path: Path, width: int
         f"scale={width}:-1",
         str(frame_path),
     ], capture=False)
+    return frame_path.is_file() and frame_path.stat().st_size > 0
 
 
 def post_layout(api_url: str, image_path: Path, timeout: float) -> dict[str, Any]:
@@ -663,7 +664,9 @@ def build_score_image(video_path: Path, meta_path: Path, score_path: Path, args:
         frame_paths: list[Path] = []
         for index, start, midpoint in segment_frames:
             frame_path = temp_dir / f"frame_{index:02d}.png"
-            extract_frame(video_path, midpoint, frame_path, args.score_width)
+            if not extract_frame(video_path, midpoint, frame_path, args.score_width):
+                print(f"skip {meta_path.parent.name}: missing frame {index} at {format_timestamp(midpoint)}", flush=True)
+                return
             if frame_size is None:
                 frame_size = image_size(frame_path)
             layout_summary: dict[str, Any] | None = None

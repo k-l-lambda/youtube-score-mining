@@ -14,6 +14,14 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 VIDEO_EXTENSIONS = {".webm", ".mkv", ".mp4", ".mov", ".m4v"}
 DEFAULT_MIDI_NAME = "transkun.mid"
+COPY_AUDIO_EXTENSIONS = {
+    "aac": ".m4a",
+    "alac": ".m4a",
+    "mp3": ".mp3",
+    "opus": ".webm",
+    "vorbis": ".ogg",
+    "flac": ".flac",
+}
 
 
 def load_env(env_path: Path, *, override: bool = False) -> None:
@@ -103,6 +111,60 @@ def find_videos(video_dir: Path) -> list[Path]:
     return videos
 
 
+def audio_codec(video_path: Path) -> str:
+    try:
+        result = subprocess.run([
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=codec_name",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(video_path),
+        ], check=True, stdout=subprocess.PIPE, text=True)
+    except FileNotFoundError as exc:
+        raise SystemExit("Required executable not found: ffprobe") from exc
+    except subprocess.CalledProcessError as exc:
+        raise SystemExit(f"ffprobe failed for {video_path}: exit code {exc.returncode}") from exc
+    codec = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
+    if not codec:
+        raise SystemExit(f"No audio stream found in {video_path}")
+    return codec
+
+
+def copied_audio_path(sample_dir: Path, video_path: Path) -> Path:
+    codec = audio_codec(video_path)
+    suffix = COPY_AUDIO_EXTENSIONS.get(codec, video_path.suffix.lower())
+    return sample_dir / f"audio{suffix}"
+
+
+def extract_audio_copy(video_path: Path, audio_path: Path) -> None:
+    audio_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.run([
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(video_path),
+            "-vn",
+            "-map",
+            "0:a:0",
+            "-c:a",
+            "copy",
+            str(audio_path),
+        ], check=True)
+    except FileNotFoundError as exc:
+        raise SystemExit("Required executable not found: ffmpeg") from exc
+    except subprocess.CalledProcessError as exc:
+        raise SystemExit(f"ffmpeg audio copy failed for {video_path}: exit code {exc.returncode}") from exc
+
+
 def extract_audio(video_path: Path, audio_path: Path) -> None:
     audio_path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -129,6 +191,14 @@ def extract_audio(video_path: Path, audio_path: Path) -> None:
         raise SystemExit(f"ffmpeg failed for {video_path}: exit code {exc.returncode}") from exc
 
 
+def transcribe_source(audio_path: Path, sample_dir: Path) -> Path:
+    if audio_path.suffix.lower() == ".wav":
+        return audio_path
+    wav_path = sample_dir / ".transkun_audio.wav"
+    extract_audio(audio_path, wav_path)
+    return wav_path
+
+
 def transcribe_audio(audio_path: Path, midi_path: Path, weight_path: Path, conf_path: Path, device: str) -> None:
     midi_path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -151,30 +221,35 @@ def transcribe_audio(audio_path: Path, midi_path: Path, weight_path: Path, conf_
         raise SystemExit(f"Transkun failed for {audio_path}: exit code {exc.returncode}") from exc
 
 
-def process_video(video_path: Path, scores_dir: Path, overwrite: bool, midi: bool, weight_path: Path, conf_path: Path, device: str) -> tuple[bool, bool]:
+def process_video(video_path: Path, scores_dir: Path, overwrite: bool, midi: bool, copy_audio: bool, weight_path: Path, conf_path: Path, device: str) -> tuple[bool, bool]:
     video_id = video_id_from_path(video_path)
     sample_dir = scores_dir / video_id
     meta_path = sample_dir / "meta.yaml"
-    audio_path = sample_dir / "audio.wav"
-    midi_path = sample_dir / DEFAULT_MIDI_NAME
     audio_written = False
     midi_written = False
     if not meta_path.is_file():
         print(f"skip missing meta {video_id}", flush=True)
         return audio_written, midi_written
+    audio_path = copied_audio_path(sample_dir, video_path) if copy_audio else sample_dir / "audio.wav"
+    midi_path = sample_dir / DEFAULT_MIDI_NAME
     if audio_path.exists() and not overwrite:
-        print(f"skip existing audio {video_id}", flush=True)
+        print(f"skip existing audio {video_id}: {audio_path.name}", flush=True)
     else:
-        print(f"extract audio {video_id}: {video_path.name}", flush=True)
-        extract_audio(video_path, audio_path)
+        if copy_audio:
+            print(f"copy audio {video_id}: {video_path.name} -> {audio_path.name}", flush=True)
+            extract_audio_copy(video_path, audio_path)
+        else:
+            print(f"extract audio {video_id}: {video_path.name}", flush=True)
+            extract_audio(video_path, audio_path)
         print(f"wrote {audio_path}", flush=True)
         audio_written = True
     if midi:
         if midi_path.exists() and not overwrite:
             print(f"skip existing midi {video_id}", flush=True)
         else:
-            print(f"transcribe midi {video_id}: {audio_path.name}", flush=True)
-            transcribe_audio(audio_path, midi_path, weight_path, conf_path, device)
+            transkun_audio_path = transcribe_source(audio_path, sample_dir)
+            print(f"transcribe midi {video_id}: {transkun_audio_path.name}", flush=True)
+            transcribe_audio(transkun_audio_path, midi_path, weight_path, conf_path, device)
             print(f"wrote {midi_path}", flush=True)
             midi_written = True
     return audio_written, midi_written
@@ -188,7 +263,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scores-dir", type=Path, help="Output scores directory. Default: $DATA_DIR/scores")
     parser.add_argument("--limit", type=int, help="Process at most this many videos.")
     parser.add_argument("--video-id", action="append", help="Only process this video ID. Can be used multiple times.")
-    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing audio.wav and MIDI files.")
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing audio files and MIDI files.")
+    parser.add_argument("--copy-audio", action="store_true", help="Copy the first audio stream without re-encoding, writing audio.m4a/audio.webm/etc. based on codec.")
     parser.add_argument("--midi", action="store_true", help=f"Also transcribe audio to {DEFAULT_MIDI_NAME} using Transkun.")
     parser.add_argument("--transkun-weight", type=Path, help="Transkun checkpoint.pt path. Default: $TRANSKUN_V2_CHECKPOINT/checkpoint.pt")
     parser.add_argument("--transkun-conf", type=Path, help="Transkun model.conf path. Default: $TRANSKUN_V2_CHECKPOINT/model.conf")
@@ -222,7 +298,7 @@ def main() -> None:
     extracted = 0
     transcribed = 0
     for video_path in videos:
-        audio_written, midi_written = process_video(video_path, scores_dir, args.overwrite, args.midi, weight_path, conf_path, args.device)
+        audio_written, midi_written = process_video(video_path, scores_dir, args.overwrite, args.midi, args.copy_audio, weight_path, conf_path, args.device)
         if audio_written:
             extracted += 1
         if midi_written:
