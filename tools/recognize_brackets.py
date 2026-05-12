@@ -145,8 +145,29 @@ def parse_simple_yaml(lines: list[str], start_index: int, base_indent: int) -> t
                 break
             rest = line[base_indent + 1 :].strip()
             if rest:
-                items.append(read_scalar(rest))
-                index += 1
+                key, sep, value = rest.partition(":")
+                if sep and key.strip():
+                    item = {key.strip(): read_scalar(value)}
+                    index += 1
+                    while index < len(lines):
+                        line = lines[index]
+                        if line.startswith(" " * base_indent + "-"):
+                            break
+                        if not line.strip():
+                            index += 1
+                            continue
+                        indent = len(line) - len(line.lstrip(" "))
+                        if indent <= base_indent:
+                            break
+                        stripped = line.strip()
+                        sub_key, sub_sep, sub_value = stripped.partition(":")
+                        if sub_sep:
+                            item[sub_key] = read_scalar(sub_value)
+                        index += 1
+                    items.append(item)
+                else:
+                    items.append(read_scalar(rest))
+                    index += 1
             else:
                 value, index = parse_simple_yaml(lines, index + 1, base_indent + 2)
                 items.append(value)
@@ -220,6 +241,12 @@ def yaml_scalar(value: Any) -> str:
     return yaml_quote(str(value))
 
 
+def yaml_value(key: str, value: Any) -> str:
+    if isinstance(value, str) and key in {"video_id", "method", "role"}:
+        return value
+    return yaml_scalar(value)
+
+
 def yaml_lines(value: Any, indent: int = 0) -> list[str]:
     prefix = " " * indent
     if isinstance(value, dict):
@@ -229,7 +256,7 @@ def yaml_lines(value: Any, indent: int = 0) -> list[str]:
                 lines.append(f"{prefix}{key}:")
                 lines.extend(yaml_lines(item, indent + 2))
             else:
-                lines.append(f"{prefix}{key}: {yaml_scalar(item)}")
+                lines.append(f"{prefix}{key}: {yaml_value(str(key), item)}")
         return lines
     if isinstance(value, list):
         lines = []
@@ -244,7 +271,7 @@ def yaml_lines(value: Any, indent: int = 0) -> list[str]:
 
 
 def ordered_meta(meta: dict[str, Any]) -> dict[str, Any]:
-    priority = ["video_id", "duration", "duration_seconds", "shot_detection", "staff_n", "staffLayout", "layout"]
+    priority = ["video_id", "video_title", "video_channel", "duration", "duration_seconds", "shot_detection", "staff_n", "staffLayout", "layout"]
     output: dict[str, Any] = {}
     for key in priority:
         if key in meta:
@@ -255,8 +282,108 @@ def ordered_meta(meta: dict[str, Any]) -> dict[str, Any]:
     return output
 
 
-def write_meta(meta_path: Path, meta: dict[str, Any]) -> None:
-    meta_path.write_text("\n".join(yaml_lines(ordered_meta(meta))).rstrip() + "\n", encoding="utf-8")
+def update_staff_layout_line(lines: list[str], staff_layout_code: str) -> list[str]:
+    output: list[str] = []
+    inserted = False
+    for line in lines:
+        if line.startswith("staffLayout:"):
+            if not inserted:
+                output.append(f"staffLayout: {yaml_quote(staff_layout_code)}")
+                inserted = True
+            continue
+        output.append(line)
+        if not inserted and line.startswith("staff_n:"):
+            output.append(f"staffLayout: {yaml_quote(staff_layout_code)}")
+            inserted = True
+    if not inserted:
+        for index, line in enumerate(output):
+            if line == "layout:":
+                output.insert(index, f"staffLayout: {yaml_quote(staff_layout_code)}")
+                inserted = True
+                break
+    if not inserted:
+        output.append(f"staffLayout: {yaml_quote(staff_layout_code)}")
+    return output
+
+
+def patch_area_block(block: list[str], system: SystemLayout | None) -> list[str]:
+    output = [
+        line for line in block
+        if not line.startswith("          bracketsAppearance:") and not line.startswith("          staffMask:")
+    ]
+    if system is None:
+        return output
+    output.append(f"          bracketsAppearance: {yaml_quote(system.brackets or '')}")
+    output.append(f"          staffMask: {yaml_scalar(system.staff_mask)}")
+    return output
+
+
+def patch_layout_area_blocks(lines: list[str], systems: list[SystemLayout]) -> list[str]:
+    by_key = {(system.frame_index, system.system_index): system for system in systems}
+    output: list[str] = []
+    frame_index = 0
+    area_index = 0
+    in_layout = False
+    in_frames = False
+    in_areas = False
+    area_block: list[str] | None = None
+
+    def flush_area() -> None:
+        nonlocal area_block
+        if area_block is not None:
+            output.extend(patch_area_block(area_block, by_key.get((frame_index, area_index))))
+            area_block = None
+
+    for line in lines:
+        if area_block is not None:
+            if line == "        -" or line == "    -" or (line and not line.startswith(" ")) or (line.startswith("  ") and not line.startswith("    ")):
+                flush_area()
+            else:
+                area_block.append(line)
+                continue
+
+        if line == "layout:":
+            in_layout = True
+            in_frames = False
+            in_areas = False
+            output.append(line)
+            continue
+        if in_layout and line and not line.startswith(" "):
+            in_layout = False
+            in_frames = False
+            in_areas = False
+            output.append(line)
+            continue
+        if in_layout and line == "  frames:":
+            in_frames = True
+            in_areas = False
+            output.append(line)
+            continue
+        if in_frames and line == "    -":
+            frame_index += 1
+            area_index = 0
+            in_areas = False
+            output.append(line)
+            continue
+        if in_frames and line == "      areas:":
+            in_areas = True
+            output.append(line)
+            continue
+        if in_areas and line == "        -":
+            area_index += 1
+            area_block = [line]
+            continue
+        output.append(line)
+
+    flush_area()
+    return output
+
+
+def write_bracket_results(meta_path: Path, staff_layout_code: str, systems: list[SystemLayout]) -> None:
+    lines = meta_path.read_text(encoding="utf-8").splitlines()
+    lines = update_staff_layout_line(lines, staff_layout_code)
+    lines = patch_layout_area_blocks(lines, systems)
+    meta_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
 def attach_bracket_results(meta: dict[str, Any], staff_layout_code: str, systems: list[SystemLayout]) -> None:
@@ -541,8 +668,7 @@ def process_sample(video_id: str, video_path: Path, meta_path: Path, args: argpa
                 Image.open(path).save(debug_path)
                 system.bracket_image = debug_path.name
     staff_layout_code, systems = infer_staff_layout(systems)
-    attach_bracket_results(meta, staff_layout_code, systems)
-    write_meta(meta_path, meta)
+    write_bracket_results(meta_path, staff_layout_code, systems)
     print(f"done {video_id}: staffLayout={staff_layout_code}", flush=True)
     return {
         "video_id": video_id,
@@ -605,6 +731,7 @@ def main() -> None:
             print(f"skip missing video {video_id}", flush=True)
             continue
         samples.append((video_id, video_path, meta_path))
+    samples.sort(key=lambda sample: (sample[0] != "2AX6vPPVGMw", sample[0]))
     if args.limit is not None:
         samples = samples[: args.limit]
     total = len(samples)
