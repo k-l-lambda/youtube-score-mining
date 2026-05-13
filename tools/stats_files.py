@@ -47,6 +47,14 @@ def file_type(path: Path) -> str:
     return suffix if suffix else "[no extension]"
 
 
+def iter_score_files(scores_dir: Path):
+    for root, dirs, files in os.walk(scores_dir):
+        dirs[:] = [name for name in dirs if not (name.startswith(".yt_") or name.startswith(".yt-"))]
+        root_path = Path(root)
+        for name in files:
+            yield root_path / name
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Summarize total file sizes by extension under data/scores.")
     parser.add_argument("--env", type=Path, default=PROJECT_ROOT / ".env", help="Base environment file. Default: .env")
@@ -67,9 +75,7 @@ def main() -> None:
     sizes: dict[str, int] = defaultdict(int)
     total_count = 0
     total_size = 0
-    for path in scores_dir.rglob("*"):
-        if not path.is_file():
-            continue
+    for path in iter_score_files(scores_dir):
         kind = file_type(path)
         size = path.stat().st_size
         counts[kind] += 1
