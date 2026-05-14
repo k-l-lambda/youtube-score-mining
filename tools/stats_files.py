@@ -44,7 +44,7 @@ def human_size(size: int) -> str:
 
 def file_type(path: Path) -> str:
     suffix = path.suffix.lower()
-    if suffix == ".json":
+    if suffix in [".json", ".yaml"]:
         return path.name
     return suffix if suffix else "[no extension]"
 
