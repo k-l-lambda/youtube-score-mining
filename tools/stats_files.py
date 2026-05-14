@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize file sizes by extension under data/scores."""
+"""Summarize file sizes by extension under data/scores, with JSON files split by name."""
 
 from __future__ import annotations
 
@@ -44,19 +44,21 @@ def human_size(size: int) -> str:
 
 def file_type(path: Path) -> str:
     suffix = path.suffix.lower()
+    if suffix == ".json":
+        return path.name
     return suffix if suffix else "[no extension]"
 
 
 def iter_score_files(scores_dir: Path):
     for root, dirs, files in os.walk(scores_dir):
-        dirs[:] = [name for name in dirs if not (name.startswith(".yt_") or name.startswith(".yt-"))]
+        dirs[:] = [name for name in dirs if not name.startswith(".")]
         root_path = Path(root)
         for name in files:
             yield root_path / name
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Summarize total file sizes by extension under data/scores.")
+    parser = argparse.ArgumentParser(description="Summarize total file sizes by extension under data/scores, with JSON files split by name.")
     parser.add_argument("--env", type=Path, default=PROJECT_ROOT / ".env", help="Base environment file. Default: .env")
     parser.add_argument("--env-local", type=Path, default=PROJECT_ROOT / ".env.local", help="Higher-priority environment file. Default: .env.local")
     parser.add_argument("--scores-dir", type=Path, help="Scores directory. Default: $DATA_DIR/scores")
