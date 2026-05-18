@@ -324,6 +324,16 @@ def find_final_frame_before_outro(windows: list[TimeWindow], duration: float, st
     return duration
 
 
+def starts_with_score_region(video_path: Path, region: FlatRegion, near_start_seconds: float, min_seconds: float, yavg_min: float, satavg_max: float) -> bool:
+    if region.start > near_start_seconds or region.end - region.start < min_seconds:
+        return False
+    frame = extract_rgb_frame(video_path, (region.start + region.end) / 2)
+    if frame is None:
+        return False
+    stats = analyze_frame(frame, (region.start + region.end) / 2)
+    return stats.yavg >= yavg_min and stats.satavg <= satavg_max
+
+
 def collect_adjacent_frame_diffs(video_path: Path, duration: float, width: int, height: int) -> list[AdjacentFrameDiff]:
     proc = subprocess.Popen([
         "ffmpeg",
@@ -466,6 +476,15 @@ def segment_video(video_path: Path, scores_dir: Path, args: argparse.Namespace) 
     adjacent_diffs = collect_adjacent_frame_diffs(video_path, duration, args.adjacent_diff_width, args.adjacent_diff_height)
     adjacent_threshold = adjacent_diff_threshold(adjacent_diffs, args.adjacent_diff_bins, args.adjacent_diff_ratio)
     flat_regions = find_flat_regions(adjacent_diffs, adjacent_threshold, args.adjacent_diff_min_flat_seconds) if adjacent_threshold is not None else []
+    if flat_regions and starts_with_score_region(
+        video_path,
+        flat_regions[0],
+        args.initial_score_near_start_seconds,
+        args.initial_score_min_seconds,
+        args.score_filter_yavg_min,
+        args.score_filter_satavg_max,
+    ):
+        stable_start = min(stable_start, flat_regions[0].start)
     bounded_regions = [region for region in flat_regions if region.end > stable_start and region.start < final_frame]
     if bounded_regions:
         changes.append({
@@ -518,6 +537,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--intro-change-threshold", type=float, default=0.05, help="Scene score treated as intro motion. Default: 0.05")
     parser.add_argument("--window-seconds", type=float, default=5.0, help="Window size for outro detection. Default: 5")
     parser.add_argument("--minimum-outro-seconds", type=float, default=10.0, help="Minimum trailing stable duration to mark outro. Default: 10")
+    parser.add_argument("--initial-score-near-start-seconds", type=float, default=1.0, help="Treat a flat score-like region starting this close to zero as no-intro. Default: 1")
+    parser.add_argument("--initial-score-min-seconds", type=float, default=4.0, help="Minimum initial flat score-like duration to override intro trimming. Default: 4")
     parser.add_argument("--adjacent-diff-bins", type=int, default=120, help="Histogram bins for adjacent-frame flat-region thresholding. Default: 120")
     parser.add_argument("--adjacent-diff-ratio", type=float, default=10.0, help=argparse.SUPPRESS)
     parser.add_argument("--adjacent-diff-min-flat-seconds", type=float, default=2.0, help="Minimum duration for a score flat region. Default: 2")
